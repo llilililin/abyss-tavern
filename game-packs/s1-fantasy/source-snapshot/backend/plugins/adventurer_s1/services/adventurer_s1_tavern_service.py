@@ -98,6 +98,51 @@ def invalidate_parties_board_cache() -> None:
 def invalidate_tavern_upgrade_cache() -> None:
     _tavern_upgrade_cache.clear()
 
+
+def _backfill_member_update_names(full_log: object) -> None:
+    """给 full_log.member_updates 补齐缺失的 name（就地修改）。
+
+    生成阶段写入的 member_updates 只带 id，没有 name。前端成员卡直接读
+    ``memberUpdates[].name``，读不到就回退成「冒险者 #id」。玩家视图在
+    ``build_player_s1_full_log`` 里会补名，但管理员视图走 ``to_dict`` 原始
+    数据，因此在这里统一兜底。
+    """
+    if not isinstance(full_log, dict):
+        return
+    updates = full_log.get('member_updates')
+    if not isinstance(updates, list):
+        return
+    missing = []
+    for update in updates:
+        if not isinstance(update, dict) or update.get('name'):
+            continue
+        try:
+            adv_id = int(update.get('id'))
+        except (TypeError, ValueError):
+            continue
+        missing.append(adv_id)
+    if not missing:
+        return
+    rows = (
+        db.session.query(AdventurerS1.id, AdventurerS1.name)
+        .filter(AdventurerS1.id.in_(missing))
+        .all()
+    )
+    name_by_id = {row[0]: row[1] for row in rows if row[1]}
+    if not name_by_id:
+        return
+    for update in updates:
+        if not isinstance(update, dict) or update.get('name'):
+            continue
+        try:
+            adv_id = int(update.get('id'))
+        except (TypeError, ValueError):
+            continue
+        name = name_by_id.get(adv_id)
+        if name:
+            update['name'] = name
+
+
 class AdventurerS1TavernService:
 
     @staticmethod
@@ -438,6 +483,9 @@ class AdventurerS1TavernService:
                 data['full_log'] = build_player_s1_full_log(full_log if isinstance(full_log, dict) else {})
         from plugins.adventurer_s1.services.adventurer_s1_log_service import resolve_expedition_log_member_names
         data['members'] = resolve_expedition_log_member_names(log, raw_full_log, data.get('full_log'))
+        # member_updates 原始数据只带 id，前端读不到 name 会回退成「冒险者 #id」。
+        # 统一在此补齐名字（管理员视图走 to_dict 原始数据，不经过裁剪阶段的补名）。
+        _backfill_member_update_names(data.get('full_log'))
         visible_full_log = _commentable_public_full_log(log) if is_admin else data.get('full_log') if isinstance(data.get('full_log'), dict) else {}
         data['comment_counts'] = _build_visible_comment_counts(visible_full_log, log.status, get_comment_counts(log.id))
         data['like_info'] = AdventurerS1TavernService._build_log_like_info(log, user_id)
